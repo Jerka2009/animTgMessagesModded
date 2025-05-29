@@ -4,13 +4,16 @@ import os
 import sys
 import requests
 from telethon import events, TelegramClient
+from telethon.tl.types import InputPeerNotifySettings, InputNotifyPeer
+from telethon.tl.functions.account import UpdateNotifySettingsRequest
+import time
 
 # Константы
 CONFIG_FILE = "config.json"
 DEFAULT_TYPING_SPEED = 0.5
 DEFAULT_CURSOR = "\u2588"  # Символ по умолчанию для анимации
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/Jerka2009/animTgMessagesModded/refs/heads/main/main.py"  # Укажите URL вашего скрипта
-SCRIPT_VERSION = "1.66.32"
+SCRIPT_VERSION = "1.73.22"
 
 # Проверяем наличие файла конфигурации
 if os.path.exists(CONFIG_FILE):
@@ -393,6 +396,164 @@ async def update_script(event):
         print(f"Ошибка при обновлении: {e}")
         await event.reply("<b>Произошла ошибка при обновлении скрипта.</b>", parse_mode='html')
 
+# Добавим глобальную переменную для отслеживания последнего запроса
+last_request_time = 0
+
+async def update_notify_settings(entity, silent, message):
+    """Обновляет настройки уведомлений для указанной сущности"""
+    global last_request_time
+    try:
+        # Проверяем, прошло ли достаточно времени с последнего запроса
+        current_time = time.time()
+        time_since_last_request = current_time - last_request_time
+        
+        if time_since_last_request < 3:  # Минимальная задержка 3 секунды
+            await asyncio.sleep(3 - time_since_last_request)
+        
+        settings = InputPeerNotifySettings(
+            silent=silent,
+            mute_until=2**31-1 if silent else None,
+            show_previews=True
+        )
+        peer = InputNotifyPeer(entity)
+        
+        try:
+            await client(UpdateNotifySettingsRequest(
+                peer=peer,
+                settings=settings
+            ))
+            last_request_time = time.time()
+        except Exception as e:
+            if "wait" in str(e).lower():
+                wait_time = int(str(e).split("wait of ")[1].split(" seconds")[0])
+                await message.edit(f"⏳ Требуется ожидание {wait_time} секунд ({wait_time//60} минут). Приостанавливаю выполнение...")
+                await asyncio.sleep(wait_time)
+                # Повторяем запрос после ожидания
+                await client(UpdateNotifySettingsRequest(
+                    peer=peer,
+                    settings=settings
+                ))
+                last_request_time = time.time()
+            else:
+                raise
+                
+    except Exception as e:
+        print(f"Ошибка при обновлении настроек для {entity.id}: {e}")
+        raise
+
+async def update_status_message(message, new_status, last_status):
+    """Обновляет статусное сообщение с обработкой ошибок"""
+    if new_status != last_status:
+        try:
+            await message.edit(new_status)
+            return new_status
+        except Exception as e:
+            if "MessageNotModifiedError" not in str(e):
+                print(f"Ошибка при обновлении статуса: {e}")
+    return last_status
+
+async def process_entities(event, entity_type, mute_action, status_prefix):
+    """Общая функция для обработки сущностей (контакты/боты/каналы)"""
+    start_time = time.time()
+    message = await event.reply(f"⏳ {status_prefix}...")
+    dialogs = await client.get_dialogs()
+    
+    # Фильтруем сущности в зависимости от типа
+    if entity_type == "contacts":
+        entities = [d for d in dialogs if d.is_user and not d.entity.bot]
+    elif entity_type == "bots":
+        entities = [d for d in dialogs if d.is_user and d.entity.bot]
+    else:  # channels
+        entities = [d for d in dialogs if d.is_channel]
+    
+    total = len(entities)
+    processed = 0
+    success_count = 0
+    last_status = ""
+    
+    for dialog in entities:
+        try:
+            await update_notify_settings(dialog.entity, mute_action, message)
+            success_count += 1
+        except Exception as e:
+            print(f"Ошибка для {dialog.name}: {e}")
+        
+        processed += 1
+        if processed % 5 == 0:
+            new_status = f"⏳ {status_prefix}: {success_count}/{total}..."
+            last_status = await update_status_message(message, new_status, last_status)
+            await asyncio.sleep(0.5)
+    
+    elapsed = time.time() - start_time
+    final_message = f"✅ Готово! {status_prefix}: {success_count}/{total}. Время: {elapsed:.1f}с"
+    await update_status_message(message, final_message, last_status)
+
+# Обновленные обработчики команд
+@client.on(events.NewMessage(pattern='/mute$'))
+async def mute_contacts(event):
+    await process_entities(event, "contacts", True, "Отключаю звук для контактов")
+
+@client.on(events.NewMessage(pattern='/mute_bots$'))
+async def mute_bots(event):
+    await process_entities(event, "bots", True, "Отключаю звук для ботов")
+
+@client.on(events.NewMessage(pattern='/mute_channels$'))
+async def mute_channels(event):
+    await process_entities(event, "channels", True, "Отключаю звук для каналов")
+
+@client.on(events.NewMessage(pattern='/unmute$'))
+async def unmute_contacts(event):
+    await process_entities(event, "contacts", False, "Включаю звук для контактов")
+
+@client.on(events.NewMessage(pattern='/unmute_bots$'))
+async def unmute_bots(event):
+    await process_entities(event, "bots", False, "Включаю звук для ботов")
+
+@client.on(events.NewMessage(pattern='/unmute_channels$'))
+async def unmute_channels(event):
+    await process_entities(event, "channels", False, "Включаю звук для каналов")
+
+# Команда помощи
+@client.on(events.NewMessage(pattern='/mute_help$'))
+async def mute_help(event):
+    help_text = """
+🔇 **Команды управления уведомлениями** 🔇
+
+`/mute` - Выключить звук для контактов
+`/mute_bots` - Выключить звук для ботов
+`/mute_channels` - Выключить звук для каналов
+`/mute_all` - Выключить звук везде
+
+`/unmute` - Включить звук для контактов
+`/unmute_bots` - Включить звук для ботов
+`/unmute_channels` - Включить звук для каналов
+`/unmute_all` - Включить звук везде
+
+ℹ️ *Примечания:*
+- Операции могут занять время при большом количестве чатов
+- Для каналов, где вы только подписчик, могут быть ограничения
+- Боты: @{bot_username}
+"""
+    bot_username = (await client.get_me()).username
+    await event.reply(help_text.format(bot_username=bot_username))
+
+# Команда помощи1
+@client.on(events.NewMessage(pattern='/help$'))
+async def help(event):
+    help_text = """
+    Версия бота: {scrVeris}
+    - Напишите в чате /p (текст) для анимации печатания.
+    - Используйте /s (задержка) для изменения скорости печатания.
+    - Используйте /c (символ) для изменения символа курсора анимации.
+    - Используйте /sp (текст) (количество) (скорость отправки).
+    - Используйте /update для обновления скрипта с GitHub.
+    - Используйте /support для поддержки автора.
+    - Используйте 'сердечки' для создания анимации сердца
+    - Используйте 'skull' для создания анимации черепка
+    - Используйте 'creeper' для создания анимации крипера
+    - Используйте 'сиске' для создания анимации медвежонка
+"""
+    await event.reply(help_text.format(scrVeris=SCRIPT_VERSION))
 
 async def main():
     print(f"Запуск main()\nВерсия скрипта: {SCRIPT_VERSION} (Modded by Jerka2009)")
@@ -402,7 +563,7 @@ async def main():
     print("- Напишите в чате /p (текст) для анимации печатания.")
     print("- Используйте /s (задержка) для изменения скорости печатания.")
     print("- Используйте /c (символ) для изменения символа курсора анимации.")
-    print("= Используйте /sp (текст) (количество) (скорость отправки).")
+    print("- Используйте /sp (текст) (количество) (скорость отправки).")
     print("- Используйте /update для обновления скрипта с GitHub.")
     print("- Используйте /support для поддержки автора.")
     print("- Используйте 'сердечки' для создания анимации сердца")
